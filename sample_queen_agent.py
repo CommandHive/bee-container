@@ -1,22 +1,32 @@
-#!/usr/bin/env python3
-"""
-Test script to verify FastAgent functionality with JSON config loading.
-Dynamic agent creation from JSON configuration.
-"""
-
 import asyncio
 import json
 from typing import Dict, List
-from rich import print as rich_print
 import os
-from mcp_agent.core.fastagent import FastAgent
+from  mcp_agent.core.fastagent import FastAgent
 from dotenv import load_dotenv
 load_dotenv()
 import redis.asyncio as aioredis
 
 '''
+Redis example:
  redis-cli PUBLISH agent:queen '{"type": "user", "content": "tell me price of polygon please", "channel_id": "agent:queen",
   "metadata": {"model": "claude-3-5-haiku-latest", "name": "default"}}'
+
+Kafka example (if using Kafka backend):
+ kafka-console-producer --broker-list localhost:9092 --topic mcp_agent_queen
+ {"type": "user", "content": "tell me price of polygon please", "channel_id": "agent:queen", "metadata": {"model": "claude-3-5-haiku-latest", "name": "default"}}
+
+MSK example (if using MSK backend):
+ python src/msk_producer.py  # Uses the configured MSK cluster
+ # The producer will send to topic: mcp_agent_queen
+
+To switch backends:
+- Change "backend": "redis" to "backend": "kafka" or "backend": "msk" in pubsub_config  
+- For Kafka: Install dependencies: pip install bee-agent[kafka]
+- For MSK: Install dependencies: pip install aiokafka aws-msk-iam-sasl-signer boto3
+- Set environment variables:
+  - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (for MSK)
+  - MSK_BOOTSTRAP_SERVERS, MSK_TOPIC_NAME (optional, has defaults)
 '''
 
 subagents_config = [
@@ -24,13 +34,13 @@ subagents_config = [
         "name": "finder",
         "instruction": "You are an agent with access to the internet; you need to search about the latest prices of Bitcoin and other major cryptocurrencies and report back.",
         "servers": ["fetch", "brave"],
-        "model": "haiku"  # Optional: specify model per agent
+        "model": "haiku"
     },
     {
         "name": "reporter",
         "instruction": "You are an agent that takes the raw pricing data provided by the finder agent and produces a concise, human-readable summary highlighting current prices, 24-hour changes, and key market insights.",
-        "servers": [],  # No specific servers needed for this agent
-        "model": "haiku"  # Optional: specify model per agent
+        "servers": [],  
+        "model": "haiku"
     }
 ]
 
@@ -48,11 +58,21 @@ sample_json_config = {
                     {
                         "name": "fetch",
                         "seek_confirm": True,
-                        "time_to_confirm": 120000,  # 2 minutes 
-                        "default": "reject"  # if the time expires then what to do. 
+                        "time_to_confirm": 120000,  
+                        "default": "reject" 
                     }
                 ]
             },
+            "google-maps":{
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@modelcontextprotocol/server-google-maps"
+                    ],
+                "env":{
+                    "GOOGLE_MAPS_API_KEY": "AIzaSyCkB37IJcttzInYSunk3IousaabMOXBO20"
+                }
+            }
             "brave": {
                 "name": "brave",
                 "description": "Brave search server",
@@ -75,17 +95,35 @@ sample_json_config = {
     },
     "pubsub_enabled": True,
     "pubsub_config": {
-        "use_redis": True,
-        "channel_name": "queen",  # This must match the agent name or channel used for publishing
-        "redis": {
-            "host": "localhost",
-            "port": 6379,
-            "db": 0,
-            "channel_prefix": "agent:"
-        }
+        "backend": "msk",  # Options: "memory", "redis", "kafka", "msk"
+        "channel_name": "queen",
+        "msk": {
+            "bootstrap_servers": [
+                "b-3-public.commandhive.aewd11.c4.kafka.ap-south-1.amazonaws.com:9198",
+                "b-1-public.commandhive.aewd11.c4.kafka.ap-south-1.amazonaws.com:9198", 
+                "b-2-public.commandhive.aewd11.c4.kafka.ap-south-1.amazonaws.com:9198"
+            ],
+            "aws_region": "ap-south-1",
+            "topic_prefix": "mcp_agent_",
+            "security_protocol": "SASL_SSL",
+            "sasl_mechanism": "OAUTHBEARER",
+            "ssl_config": {
+                "check_hostname": False,
+                "verify_mode": "none"
+            },
+            "producer_config": {
+                "acks": "all",
+                "client_id": "mcp_agent_producer"
+            },
+            "consumer_config": {
+                "auto_offset_reset": "latest",
+                "enable_auto_commit": True,
+                "client_id": "mcp_agent_consumer"
+            }
+        },
     },
     "anthropic": {
-        "api_key": os.environ.get("CLAUDE_API_KEY", "")  # Fixed typo: was CALUDE_API_KEY
+        "api_key": os.environ.get("CLAUDE_API_KEY", "") 
     }
 }
 
@@ -111,7 +149,6 @@ def create_agents_from_config(config_list: List[Dict]) -> List[str]:
         model = agent_config.get("model", None)
         
         if not name:
-            rich_print(f"[red]Warning: Agent config missing name, skipping: {agent_config}[/red]")
             continue
             
         # Create agent decorator kwargs
@@ -132,7 +169,6 @@ def create_agents_from_config(config_list: List[Dict]) -> List[str]:
             pass
             
         agent_names.append(name)
-        rich_print(f"[green]Created agent: {name}[/green]")
     
     return agent_names
 
@@ -152,8 +188,6 @@ async def orchestrate_task():
 
 async def main():
     """Test initializing FastAgent with JSON config in interactive mode."""
-    rich_print("Testing FastAgent initialization with JSON config...")
-    rich_print(f"[blue]Created agents: {created_agent_names}[/blue]")
     
     # Create Redis client
     redis_client = aioredis.Redis(
@@ -175,12 +209,9 @@ async def main():
            Can you find the price of VANA token and if it is more than 50 percent of it;s lowest then give command to sell it off. tell me now sell it off or hold it. 
             """
             
-            rich_print("[cyan]Starting initial orchestration task...[/cyan]")
             await agent.orchestrate(initial_task)
-            rich_print("[green]Initial task completed![/green]")
             
             # Keep running and listen for Redis messages
-            rich_print("[yellow]Listening for Redis messages on channel 'agent:queen'...[/yellow]")
             while True:
                 # Process Redis messages directly
                 message = await pubsub.get_message(ignore_subscribe_messages=True)
@@ -198,30 +229,20 @@ async def main():
                             # If this is a user message, extract content and send to orchestrator
                             if data_obj.get('type') == 'user' and 'content' in data_obj:
                                 user_input = data_obj['content']
-                                rich_print(f"[blue]Received user input:[/blue] {user_input}")
                                 
                                 # Send to orchestrator instead of individual agent
                                 response = await agent.orchestrate(user_input)
-                                rich_print(f"[green]Orchestrator response:[/green] {response}")
                                 
                         except json.JSONDecodeError:
-                            rich_print(f"[red]Received non-JSON message:[/red] {data}")
                             # Try to process as plain text
                             response = await agent.orchestrate(data)
-                            rich_print(f"[green]Orchestrator response:[/green] {response}")
                             
                     except Exception as e:
-                        rich_print(f"[bold red]Error processing Redis message:[/bold red] {e}")
                         import traceback
-                        rich_print(f"[dim red]{traceback.format_exc()}[/dim red]")
                 
                 # Small delay to prevent CPU spike
                 await asyncio.sleep(0.05)
                 
-        except asyncio.CancelledError:
-            rich_print("[yellow]Agent was cancelled[/yellow]")
-        except KeyboardInterrupt:
-            rich_print("[yellow]Agent stopped by user[/yellow]")
         finally:
             # Clean up Redis connection
             if 'pubsub' in locals():
@@ -232,4 +253,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        rich_print("\n[yellow]Agent stopped by user[/yellow]")
+        pass
