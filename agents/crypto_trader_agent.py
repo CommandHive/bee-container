@@ -2,45 +2,28 @@ import asyncio
 import json
 from typing import Dict, List
 import os
-from  mcp_agent.core.fastagent import FastAgent
+from mcp_agent.core.fastagent import FastAgent
 from dotenv import load_dotenv
 load_dotenv()
 import redis.asyncio as aioredis
 
 '''
-Redis example:
  redis-cli PUBLISH agent:queen '{"type": "user", "content": "tell me price of polygon please", "channel_id": "agent:queen",
-  "metadata": {"model": "claude-3-5-haiku-latest", "name": "default"}}'
-
-Kafka example (if using Kafka backend):
- kafka-console-producer --broker-list localhost:9092 --topic mcp_agent_queen
- {"type": "user", "content": "tell me price of polygon please", "channel_id": "agent:queen", "metadata": {"model": "claude-3-5-haiku-latest", "name": "default"}}
-
-MSK example (if using MSK backend):
- python src/msk_producer.py  # Uses the configured MSK cluster
- # The producer will send to topic: mcp_agent_queen
-
-To switch backends:
-- Change "backend": "redis" to "backend": "kafka" or "backend": "msk" in pubsub_config  
-- For Kafka: Install dependencies: pip install bee-agent[kafka]
-- For MSK: Install dependencies: pip install aiokafka aws-msk-iam-sasl-signer boto3
-- Set environment variables:
-  - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (for MSK)
-  - MSK_BOOTSTRAP_SERVERS, MSK_TOPIC_NAME (optional, has defaults)
+  "metadata": {"model": "haiku3", "name": "default"}}'
 '''
 
-subagents_config = [
+worker_bees = [
     {
         "name": "finder",
         "instruction": "You are an agent with access to the internet; you need to search about the latest prices of Bitcoin and other major cryptocurrencies and report back.",
-        "servers": ["fetch"],
-        "model": "haiku"
+        "servers": ["brave"],
+        "model": "haiku3"
     },
     {
         "name": "reporter",
-        "instruction": "You are an agent that takes the raw pricing data provided by the finder agent and produces a concise, human-readable summary highlighting current prices, 24-hour changes, and key market insights.",
+        "instruction": "You are an agent that takes the raw pricing data provided by the finder agent and produces a concise, human-readable summary highlighting current prices, 24-hour changes, and key market insights. You need to post them on twitter and notion page.  ",
         "servers": [],  
-        "model": "haiku"
+        "model": "haiku3"
     }
 ]
 
@@ -48,59 +31,67 @@ subagents_config = [
 sample_json_config = {
     "mcp": {
         "servers": {
-            "fetch": {
-                "name": "fetch",
-                "description": "A server for fetching links",
+            # "twitter-mcp": {
+            #     "name": "Twitter",
+            #     "description" : "Post on Twitter, and get tweets, limited by rate of twitter's developer console.",
+            #     "command": "npx",
+            #     "args": ["-y", "@enescinar/twitter-mcp"],
+            #     "env": {
+            #         "API_KEY": os.getenv("TWITTER_API_KEY"),
+            #         "API_SECRET_KEY": os.getenv("TWITTER_API_SECRET_KEY"),
+            #         "ACCESS_TOKEN": os.getenv("TWITTER_ACCESS_TOKEN"),
+            #         "ACCESS_TOKEN_SECRET": os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
+            #     }
+            # },
+            # "notion-api": {
+            #         "name": "Notion",
+            #         "description": "Create pages in Notion and fetch notion content!",
+            #         "command": "/Users/vaibhavgeek/hackathons/notion-api-mcp/.venv/bin/python",
+            #         "args": ["-m", "notion_api_mcp"],
+            #         "env": {
+            #             "NOTION_API_KEY": os.getenv("NOTION_API_KEY"),
+            #             "NOTION_PARENT_PAGE_ID": os.getenv("NOTION_PARENT_PAGE_ID")
+            #         }
+            # },
+            "brave": {
+                "name": "brave",
+                "description": "Brave search server, helps you look up internet search results, not very accurate at times. ",
                 "transport": "stdio",
-                "command": "uvx",
-                "args": ["mcp-server-fetch"],
-                "tool_calls": [
-                    {
-                        "name": "fetch",
-                        "seek_confirm": True,
-                        "time_to_confirm": 120000,  
-                        "default": "reject" 
-                    }
-                ]
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@modelcontextprotocol/server-brave-search"
+                ],
+                "env": {
+                    "BRAVE_API_KEY": ""
+                }
             }
         }
     },
-    "default_model": "haiku",   
+    "default_model": "o3-mini",   
     "logger": {
         "level": "info",
         "type": "console"
     },
     "pubsub_enabled": True,
     "pubsub_config": {
-        "backend": "msk",  # Options: "memory", "redis", "kafka", "msk"
+        "backend": "redis",
+        "use_redis": True,
         "channel_name": "queen",
-        "msk": {
-            "bootstrap_servers": [
-                "b-3-public.commandhive.aewd11.c4.kafka.ap-south-1.amazonaws.com:9198",
-                "b-1-public.commandhive.aewd11.c4.kafka.ap-south-1.amazonaws.com:9198", 
-                "b-2-public.commandhive.aewd11.c4.kafka.ap-south-1.amazonaws.com:9198"
-            ],
-            "aws_region": "ap-south-1",
-            "topic_prefix": "mcp_agent_",
-            "security_protocol": "SASL_SSL",
-            "sasl_mechanism": "OAUTHBEARER",
-            "ssl_config": {
-                "check_hostname": False,
-                "verify_mode": "none"
-            },
-            "producer_config": {
-                "acks": "all",
-                "client_id": "mcp_agent_producer"
-            },
-            "consumer_config": {
-                "auto_offset_reset": "latest",
-                "enable_auto_commit": True,
-                "client_id": "mcp_agent_consumer"
-            }
-        },
+        "redis": {
+            "host": "localhost",
+            "port": 6379,
+            "db": 0,
+            "channel_prefix": "agent:"
+        }
     },
     "anthropic": {
-        "api_key": os.environ.get("CLAUDE_API_KEY", "") 
+        "api_key": os.getenv("CLAUDE_API_KEY")
+    },
+    "azure": {
+        "api_key": os.getenv("AZURE_API_KEY"),
+        "base_url": os.getenv("AZURE_BASE_URL", "https://ai.openai.azure.com/"),
+        "default_model": "gpt-4o-mini"
     }
 }
 
@@ -150,13 +141,12 @@ def create_agents_from_config(config_list: List[Dict]) -> List[str]:
     return agent_names
 
 # Create agents from configuration
-created_agent_names = create_agents_from_config(subagents_config)
+created_agent_names = create_agents_from_config(worker_bees)
 
 # Create orchestrator with the dynamically created agents
 @fast.orchestrator(
     name="orchestrate", 
     agents=created_agent_names,  # Use the list of created agent names
-    plan_type="full",
     model="haiku"
 )
 async def orchestrate_task():
@@ -183,7 +173,7 @@ async def main():
             
             # Initial task for the orchestrator
             initial_task = """
-           Can you find the price of VANA token and if it is more than 50 percent of it;s lowest then give command to sell it off. tell me now sell it off or hold it. 
+                Can you check the price movement of polygon, stellar and bitcoin token, Tweet about the current price action of tokens and staking benefits. 
             """
             
             await agent.orchestrate(initial_task)

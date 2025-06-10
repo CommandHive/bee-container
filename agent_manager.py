@@ -10,8 +10,10 @@ import redis.asyncio as aioredis
 
 app = FastAPI(title="Agent Manager API", version="1.0.0")
 
+print(Path)
 AGENTS_DIR = Path("/app/agents")
 SUPERVISOR_AGENTS_DIR = Path("/etc/supervisor/conf.d/agents")
+MAIN_DIRECTORY = Path("/app")
 
 class SubAgent(BaseModel):
     name: str
@@ -95,27 +97,117 @@ class AgentManager:
     def _generate_supervisor_config(self, agent_name: str) -> str:
         """Generate supervisord configuration for agent"""
         return f"""[program:{agent_name}_agent]
-command=python /app/agents/{agent_name}_agent.py
-directory=/app
+command=bash -c "source {MAIN_DIRECTORY}/.venv/bin/activate && python {MAIN_DIRECTORY}/agents/{agent_name}_agent.py"
+directory={MAIN_DIRECTORY}/agents
 autostart=false
 autorestart=true
-stderr_logfile=/var/log/supervisor/{agent_name}_agent.err.log
-stdout_logfile=/var/log/supervisor/{agent_name}_agent.out.log
-user=agentuser
+stderr_logfile={MAIN_DIRECTORY}/agents/all.log
+stdout_logfile={MAIN_DIRECTORY}/agents/all.log
+user=vaibhavgeek
 """
 
     async def start_agent(self, agent_name: str) -> Dict:
         """Start an agent using supervisorctl"""
         try:
-            result = subprocess.run(
-                ["supervisorctl", "start", f"{agent_name}_agent"],
+            # Check if agent file exists first
+            agent_file = AGENTS_DIR / f"{agent_name}_agent.py"
+            print(agent_file)
+            if not agent_file.exists():
+                raise HTTPException(status_code=404, detail=f"Agent file '{agent_name}_agent.py' not found")
+            
+            # Check if supervisor config exists
+            supervisor_file = SUPERVISOR_AGENTS_DIR / f"{agent_name}.conf"
+            if not supervisor_file.exists():
+                raise HTTPException(status_code=404, detail=f"Supervisor config '{agent_name}.conf' not found")
+            
+            # First, make sure supervisor knows about the configuration
+            print(f"Updating supervisor configuration for agent '{agent_name}'...")
+            reread_result = subprocess.run(
+                ["supervisorctl", "reread"], 
                 capture_output=True, text=True, check=True
             )
-            subprocess.run(["supervisorctl", "reread"], check=True)
-            subprocess.run(["supervisorctl", "update"], check=True)
-            return {"message": f"Agent '{agent_name}' started successfully"}
+            print(f"Reread output: {reread_result.stdout}")
+            
+            update_result = subprocess.run(
+                ["supervisorctl", "update"], 
+                capture_output=True, text=True, check=True
+            )
+            print(f"Update output: {update_result.stdout}")
+            
+            # Check if the program is now known to supervisor
+            status_check = subprocess.run(
+                ["supervisorctl", "status", f"{agent_name}_agent"],
+                capture_output=True, text=True
+            )
+            
+            if status_check.returncode != 0:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Agent '{agent_name}_agent' not found in supervisor after update. "
+                        f"Status check output: {status_check.stderr or status_check.stdout}"
+                )
+            
+            # Now try to start the agent
+            print(f"Starting agent '{agent_name}_agent'...")
+            start_result = subprocess.run(
+                ["supervisorctl", "-c" , "/opt/homebrew/etc/supervisord.conf", "start", f"{agent_name}_agent"],
+                capture_output=True, text=True, check=True
+            )
+            
+            print(f"Start output: {start_result.stdout}")
+            
+            # Verify the agent actually started
+            final_status = subprocess.run(
+                ["supervisorctl", "status", f"{agent_name}_agent"],
+                capture_output=True, text=True
+            )
+            
+            return {
+                "message": f"Agent '{agent_name}' started successfully",
+                "status": final_status.stdout.strip() if final_status.returncode == 0 else "unknown",
+                "start_output": start_result.stdout.strip()
+            }
+            
         except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to start agent: {e.stderr}")
+            # Get more detailed error information
+            error_details = {
+                "command": " ".join(e.cmd) if e.cmd else "unknown",
+                "return_code": e.returncode,
+                "stdout": e.stdout.strip() if e.stdout else "",
+                "stderr": e.stderr.strip() if e.stderr else ""
+            }
+            
+            error_msg = f"Failed to start agent '{agent_name}': Command '{error_details['command']}' "
+            error_msg += f"returned non-zero exit status {error_details['return_code']}"
+            
+            if error_details['stderr']:
+                error_msg += f". Error: {error_details['stderr']}"
+            if error_details['stdout']:
+                error_msg += f". Output: {error_details['stdout']}"
+            
+            # Additional diagnostic information
+            try:
+                # Check all supervisor programs
+                all_status = subprocess.run(
+                    ["supervisorctl", "status"],
+                    capture_output=True, text=True
+                )
+                error_msg += f". All supervisor programs: {all_status.stdout}"
+            except:
+                pass
+                
+            raise HTTPException(status_code=500, detail=error_msg)
+        
+        except HTTPException:
+            # Re-raise HTTP exceptions as-is
+            raise
+        
+        except Exception as e:
+            # Handle any other unexpected errors
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Unexpected error starting agent '{agent_name}': {str(e)}"
+            )
 
     async def stop_agent(self, agent_name: str) -> Dict:
         """Stop an agent using supervisorctl"""

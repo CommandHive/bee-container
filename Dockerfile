@@ -19,15 +19,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 
-# Create app directory structure
-RUN mkdir -p /app/agents /app/logs /var/log/supervisor /etc/supervisor/conf.d
 
 # Set working directory
 WORKDIR /app
 
 # Copy requirements and install Python dependencies
-COPY backend_server/templates/requirements.txt .
-COPY backend_server/templates/sample_queen_agent.py .
+COPY requirements.txt .
+COPY sample_queen_agent.py .
+COPY agent_manager.py .
+COPY agent_template.py .
 COPY .env .
 
 ADD https://astral.sh/uv/install.sh /uv-installer.sh
@@ -39,16 +39,10 @@ ENV PATH="/root/.local/bin/:$PATH"
 
 RUN uv pip install --no-cache-dir -r requirements.txt --system
 
-COPY templates/start.sh .
-COPY templates/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 
 # Create agents supervisor config directory
 RUN mkdir -p /etc/supervisor/conf.d/agents
-
-# Create a non-root user for security
-RUN useradd -m -u 1000 agentuser && \
-    chown -R agentuser:agentuser /app
 
 # Expose port for agent communication and Redis
 EXPOSE 8080 6379
@@ -57,5 +51,6 @@ EXPOSE 8080 6379
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD redis-cli ping || exit 1
 
-# Default command
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+# Start the application
+CMD ["python", "agent_manager.py"]
+
