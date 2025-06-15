@@ -5,28 +5,127 @@ import os
 from  mcp_agent.core.fastagent import FastAgent
 from dotenv import load_dotenv
 load_dotenv()
-import redis.asyncio as aioredis
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka.abc import AbstractTokenProvider
+from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+from aiokafka.errors import TopicAlreadyExistsError
+from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
+import ssl
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def create_ssl_context():
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_context.options |= ssl.OP_NO_SSLv2
+    ssl_context.options |= ssl.OP_NO_SSLv3
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    ssl_context.load_default_certs()
+    return ssl_context
+
+class AWSTokenProvider(AbstractTokenProvider):
+    def __init__(self, region="ap-south-1"):
+        self.region = region
+    
+    async def token(self):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._generate_token)
+    
+    def _generate_token(self):
+        try:
+            token, _ = MSKAuthTokenProvider.generate_auth_token(self.region)
+            return token
+        except Exception as e:
+            logger.error(f"Failed to generate auth token: {e}")
+            raise
+
+async def ensure_topic_exists(bootstrap_servers, topic_name, num_partitions=1, replication_factor=1):
+    """Ensure Kafka topic exists, create if it doesn't"""
+    try:
+        tp = AWSTokenProvider()
+        admin_client = AIOKafkaAdminClient(
+            bootstrap_servers=bootstrap_servers,
+            security_protocol='SASL_SSL',
+            ssl_context=create_ssl_context(),
+            sasl_mechanism='OAUTHBEARER',
+            sasl_oauth_token_provider=tp,
+            client_id=f'admin_client_{topic_name}'
+        )
+        
+        await admin_client.start()
+        
+        try:
+            # Try to create the topic
+            new_topic = NewTopic(
+                name=topic_name,
+                num_partitions=num_partitions,
+                replication_factor=replication_factor
+            )
+            
+            result = await admin_client.create_topics([new_topic])
+            logger.info(f"Topic '{topic_name}' created successfully")
+            
+        except TopicAlreadyExistsError:
+            logger.info(f"Topic '{topic_name}' already exists")
+        except Exception as e:
+            logger.warning(f"Error creating topic '{topic_name}': {e}")
+            
+    except Exception as e:
+        logger.error(f"Failed to connect to Kafka admin client: {e}")
+    finally:
+        try:
+            await admin_client.close()
+        except:
+            pass
+
+async def create_msk_consumer(bootstrap_servers, topic_name, consumer_group="mcp_agent_consumer"):
+    try:
+        # Ensure topic exists before creating consumer
+        await ensure_topic_exists(bootstrap_servers, topic_name)
+        
+        tp = AWSTokenProvider()
+        consumer = AIOKafkaConsumer(
+            topic_name,
+            bootstrap_servers=bootstrap_servers,
+            group_id=consumer_group,
+            security_protocol='SASL_SSL',
+            ssl_context=create_ssl_context(),
+            sasl_mechanism='OAUTHBEARER',
+            sasl_oauth_token_provider=tp,
+            value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
+            key_deserializer=lambda k: k.decode('utf-8') if k else None,
+            auto_offset_reset='latest',
+            enable_auto_commit=True,
+            auto_commit_interval_ms=1000,
+            client_id='mcp_agent_consumer',
+            api_version="0.11.5",
+            session_timeout_ms=30000,
+            heartbeat_interval_ms=10000
+        )
+        
+        await consumer.start()
+        logger.info(f"MSK consumer created successfully for topic '{topic_name}'!")
+        return consumer
+        
+    except Exception as e:
+        logger.error(f"Failed to create MSK consumer: {str(e)}")
+        return None
 
 '''
-Redis example:
- redis-cli PUBLISH agent:queen '{"type": "user", "content": "tell me price of polygon please", "channel_id": "agent:queen",
-  "metadata": {"model": "claude-3-5-haiku-latest", "name": "default"}}'
+MSK Usage - This agent listens to AWS MSK topic: mcp_agent_queen
 
-Kafka example (if using Kafka backend):
- kafka-console-producer --broker-list localhost:9092 --topic mcp_agent_queen
- {"type": "user", "content": "tell me price of polygon please", "channel_id": "agent:queen", "metadata": {"model": "claude-3-5-haiku-latest", "name": "default"}}
+To publish messages to AWS MSK:
+ python msk_producer.py
+ # Modify the send_messages function to send your custom message like:
+ # {"type": "user", "content": "tell me price of polygon please", "channel_id": "agent:queen", "metadata": {"model": "claude-3-5-haiku-latest", "name": "default"}}
 
-MSK example (if using MSK backend):
- python src/msk_producer.py  # Uses the configured MSK cluster
- # The producer will send to topic: mcp_agent_queen
+Dependencies required:
+- pip install aiokafka aws-msk-iam-sasl-signer boto3
 
-To switch backends:
-- Change "backend": "redis" to "backend": "kafka" or "backend": "msk" in pubsub_config  
-- For Kafka: Install dependencies: pip install bee-agent[kafka]
-- For MSK: Install dependencies: pip install aiokafka aws-msk-iam-sasl-signer boto3
-- Set environment variables:
-  - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (for MSK)
-  - MSK_BOOTSTRAP_SERVERS, MSK_TOPIC_NAME (optional, has defaults)
+Environment variables needed:
+- AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
 '''
 
 subagents_config = [
@@ -164,23 +263,22 @@ async def orchestrate_task():
     pass
 
 async def main():
-    """Test initializing FastAgent with JSON config in interactive mode."""
+    """Test initializing FastAgent with JSON config using MSK for message consumption."""
     
-    # Create Redis client
-    redis_client = aioredis.Redis(
-        host="localhost",
-        port=6379,
-        db=0,
-        decode_responses=True
-    )
+    # MSK configuration from the FastAgent config
+    msk_config = sample_json_config["pubsub_config"]["msk"]
+    bootstrap_servers = msk_config["bootstrap_servers"]
+    topic_name = msk_config["topic_prefix"] + "queen"
+    
+    # Create MSK consumer
+    consumer = await create_msk_consumer(bootstrap_servers, topic_name)
+    if not consumer:
+        logger.error("Failed to create MSK consumer. Exiting.")
+        return
     
     # Register agents and keep it running
     async with fast.run() as agent:        
         try:
-            # Subscribe to the input channel
-            pubsub = redis_client.pubsub()
-            await pubsub.subscribe("agent:queen")
-            
             # Initial task for the orchestrator
             initial_task = """
            Can you find the price of VANA token and if it is more than 50 percent of it;s lowest then give command to sell it off. tell me now sell it off or hold it. 
@@ -188,43 +286,46 @@ async def main():
             
             await agent.orchestrate(initial_task)
             
-            # Keep running and listen for Redis messages
-            while True:
-                # Process Redis messages directly
-                message = await pubsub.get_message(ignore_subscribe_messages=True)
-                if message and message.get('type') == 'message':
-                    try:
-                        # Process the message data
-                        data = message.get('data')
-                        if isinstance(data, bytes):
-                            data = data.decode('utf-8')
+            # Keep running and listen for MSK messages
+            logger.info("Starting to listen for MSK messages...")
+            async for message in consumer:
+                try:
+                    # Process the message data
+                    if message.value:
+                        logger.info(f"Received message: {message.value}")
                         
-                        # Try to parse JSON
-                        try:
-                            data_obj = json.loads(data)
+                        # If this is a user message, extract content and send to orchestrator
+                        if isinstance(message.value, dict) and message.value.get('type') == 'user' and 'content' in message.value:
+                            user_input = message.value['content']
+                            logger.info(f"Processing user input: {user_input}")
                             
-                            # If this is a user message, extract content and send to orchestrator
-                            if data_obj.get('type') == 'user' and 'content' in data_obj:
-                                user_input = data_obj['content']
-                                
-                                # Send to orchestrator instead of individual agent
-                                response = await agent.orchestrate(user_input)
-                                
-                        except json.JSONDecodeError:
-                            # Try to process as plain text
-                            response = await agent.orchestrate(data)
+                            # Send to orchestrator instead of individual agent
+                            response = await agent.orchestrate(user_input)
                             
-                    except Exception as e:
-                        import traceback
-                
-                # Small delay to prevent CPU spike
-                await asyncio.sleep(0.05)
+                        elif isinstance(message.value, str):
+                            # Try to parse as JSON first
+                            try:
+                                data_obj = json.loads(message.value)
+                                if data_obj.get('type') == 'user' and 'content' in data_obj:
+                                    user_input = data_obj['content']
+                                    logger.info(f"Processing user input from JSON: {user_input}")
+                                    response = await agent.orchestrate(user_input)
+                                else:
+                                    # Process as plain text
+                                    response = await agent.orchestrate(message.value)
+                            except json.JSONDecodeError:
+                                # Process as plain text
+                                response = await agent.orchestrate(message.value)
+                                
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
         finally:
-            # Clean up Redis connection
-            if 'pubsub' in locals():
-                await pubsub.unsubscribe("agent:queen")
-            await redis_client.close()
+            # Clean up MSK consumer
+            logger.info("Stopping MSK consumer...")
+            await consumer.stop()
 
 if __name__ == "__main__":
     try:
